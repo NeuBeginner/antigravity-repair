@@ -1,0 +1,14 @@
+# Logs & runtime files
+*.log
+*.pid
+*.bin
+*.bak
+*.bak-*
+
+# Node
+node_modules/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
