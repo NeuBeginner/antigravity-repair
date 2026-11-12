@@ -4,6 +4,7 @@
 *.bin
 *.bak
 *.bak-*
+backups/
 
 # Node
 node_modules/

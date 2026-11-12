@@ -1,0 +1,14 @@
+{
+  "name": "antigravity-repair",
+  "version": "1.0.0",
+  "description": "Safe repair tool for Antigravity conversation history and archive status",
+  "scripts": {
+    "test": "node test/run_all.js",
+    "test:pbtxt": "node test/test_pbtxt.js",
+    "test:protobuf": "node test/test_protobuf.js",
+    "test:backup": "node test/test_backup_restore.js",
+    "test:safety": "node test/test_repair_safety.js",
+    "test:mock": "node test/test_mock_server.js",
+    "test:watchdog": "powershell -NoProfile -ExecutionPolicy Bypass -File test/test_watchdog.ps1"
+  }
+}
