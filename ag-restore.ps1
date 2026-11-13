@@ -23,6 +23,19 @@ $tools = $PSScriptRoot
 $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
 $node = if ($nodeCmd) { $nodeCmd.Source } elseif (Test-Path 'C:\Program Files\nodejs\node.exe') { 'C:\Program Files\nodejs\node.exe' } else { 'node' }
 
+function Invoke-NativeCapture([string]$exe, [string[]]$cmdArgs) {
+  $prevErrPref = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $raw = & $exe @cmdArgs 2>&1
+    $code = $LASTEXITCODE
+    $lines = @($raw) | ForEach-Object { "$_" }
+    return @{ ExitCode = $code; Lines = $lines }
+  } finally {
+    $ErrorActionPreference = $prevErrPref
+  }
+}
+
 function Get-LsEndpoint {
   $procs = @(Get-CimInstance Win32_Process -Filter "Name='language_server.exe'" -ErrorAction SilentlyContinue)
   if (-not $procs -or $procs.Count -eq 0) {
@@ -34,7 +47,8 @@ function Get-LsEndpoint {
                Where-Object { $_.LocalAddress -eq '127.0.0.1' } |
                Select-Object -ExpandProperty LocalPort -Unique)
     foreach ($p in $ports) {
-      $html = (& curl.exe -k -s -m 4 "https://127.0.0.1:$p/" 2>$null) -join "`n"
+      $res = Invoke-NativeCapture 'curl.exe' @('-k', '-s', '-m', '4', "https://127.0.0.1:$p/")
+      $html = $res.Lines -join "`n"
       $m = [regex]::Match($html, '"csrfToken":"([^"]+)"')
       if ($m.Success) {
         return @{ Port = $p; Token = $m.Groups[1].Value }
@@ -47,7 +61,9 @@ function Get-LsEndpoint {
 if (-not $DryRun) {
   $ls = Get-LsEndpoint
   if (-not $ls) {
-    Write-Error "Language Server endpoint not found or not responding on 127.0.0.1."
+    $msg = "ERROR: Language Server endpoint not found or not responding on 127.0.0.1."
+    [Console]::Error.WriteLine($msg)
+    Write-Output $msg
     exit 2
   }
   $env:LS_PORT = "$($ls.Port)"
@@ -67,13 +83,16 @@ if ($DryRun) {
   $nodeArgs += '--dry-run'
 }
 
-$r = & $node $nodeArgs 2>&1
-$restoreExit = $LASTEXITCODE
+$restoreRes = Invoke-NativeCapture $node $nodeArgs
+$restoreExit = $restoreRes.ExitCode
+$r = $restoreRes.Lines
 
 $r | ForEach-Object { Write-Output $_ }
 
 if ($restoreExit -ne 0) {
-  Write-Error "Restore operation failed with exit code $restoreExit."
+  $msg = "ERROR: Restore operation failed with exit code $restoreExit."
+  [Console]::Error.WriteLine($msg)
+  Write-Output $msg
   exit $restoreExit
 }
 

@@ -73,6 +73,16 @@ function runProtobufTests() {
     );
   });
 
+  test("10-byte varint with 10th byte > 0x01 throws ProtobufMalformedError", () => {
+    const bad10thByte = Buffer.from([
+      0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02,
+    ]);
+    assert.throws(
+      () => readVarint(bad10thByte, 0),
+      (err) => err instanceof ProtobufMalformedError && /exceeds 64-bit/.test(err.message)
+    );
+  });
+
   test("decodeEntries handles wire types 0, 1, 2, 5 correctly", () => {
     // Field 1 (varint, wt=0): 150 -> tag = (1 << 3) | 0 = 0x08, val = 0x96, 0x01
     // Field 2 (fixed64, wt=1): 8 bytes 0x11..0x18 -> tag = (2 << 3) | 1 = 0x11

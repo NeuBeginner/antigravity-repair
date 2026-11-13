@@ -1,4 +1,4 @@
-﻿# Automated test suite for ag-watchdog.ps1
+﻿# Automated test suite for ag-watchdog.ps1 and PowerShell exit code propagation
 # Runs strictly in an isolated temporary directory with zero production dependencies.
 
 $ErrorActionPreference = 'Stop'
@@ -6,7 +6,7 @@ $testPassed = 0
 
 function Assert-Condition([bool]$condition, [string]$message) {
   if (-not $condition) {
-    Write-Error "FAIL: $message"
+    [Console]::Error.WriteLine("FAIL: $message")
     exit 1
   }
   $global:testPassed++
@@ -21,6 +21,7 @@ New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
 try {
   $repoRoot = Resolve-Path (Join-Path $PSScriptRoot '..')
   $watchdogScript = Join-Path $repoRoot 'ag-watchdog.ps1'
+  $repairScript = Join-Path $repoRoot 'ag-repair.ps1'
   $testWatchdog = Join-Path $tempRoot 'ag-watchdog.ps1'
   Copy-Item $watchdogScript $testWatchdog
 
@@ -56,13 +57,9 @@ exit 0
 
   # Test 3: PID guard exits when genuine duplicate process is running
   Write-Host "Test 3: PID guard with duplicate instance"
-  # Spawn a mock background process with 'ag-watchdog' in its command line
   $dummyProc = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-Command', '$mockTag = "ag-watchdog"; Start-Sleep -Seconds 15') -PassThru
   try {
-    # Write its PID to watchdog.pid
     Set-Content -Path $pidFile -Value "$($dummyProc.Id)" -Encoding ASCII
-
-    # Now launch watchdog - it should detect the existing process and exit immediately
     $proc3 = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $testWatchdog, '-Rounds', '1', '-IntervalSec', '1', '-DryRun') -WorkingDirectory $tempRoot -PassThru -Wait
     Assert-Condition ($proc3.ExitCode -eq 0) "Duplicate watchdog exited cleanly"
 
@@ -71,6 +68,41 @@ exit 0
   } finally {
     try { Stop-Process -Id $dummyProc.Id -Force -ErrorAction SilentlyContinue } catch {}
   }
+
+  # Test 4: PID guard does NOT block when PID belongs to an unrelated live PowerShell process
+  Write-Host "Test 4: Unrelated live powershell.exe PID collision does not block watchdog"
+  $unrelatedProc = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-Command', '$unrelated = "other-worker"; Start-Sleep -Seconds 15') -PassThru
+  try {
+    Remove-Item $logFile -ErrorAction SilentlyContinue
+    Set-Content -Path $pidFile -Value "$($unrelatedProc.Id)" -Encoding ASCII
+
+    $proc4 = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $testWatchdog, '-Rounds', '1', '-IntervalSec', '1', '-DryRun') -WorkingDirectory $tempRoot -PassThru -Wait
+    Assert-Condition ($proc4.ExitCode -eq 0) "Watchdog did not block on unrelated powershell.exe PID"
+    Assert-Condition (-not (Test-Path $pidFile)) "Watchdog overwrote and cleaned up pidfile"
+
+    $log4 = Get-Content $logFile -Raw
+    Assert-Condition (-not ($log4 -match 'already running pid=')) "Log does not falsely report duplicate"
+    Assert-Condition ($log4 -match 'round=1 exit=0 OK no source=17') "Watchdog executed round 1 despite PID collision"
+  } finally {
+    try { Stop-Process -Id $unrelatedProc.Id -Force -ErrorAction SilentlyContinue } catch {}
+  }
+
+  # Test 5: Exit code propagation for ag-repair.ps1 (exit 2 when LS missing) and ag-watchdog.ps1 (non-zero on error)
+  Write-Host "Test 5: PowerShell exit code propagation"
+  # Test real ag-repair.ps1 with mocked Get-CimInstance so it never inspects real processes/ports
+  $noLsCmd = "function Get-CimInstance { return @() }; & '$repairScript' -DryRun; exit `$LASTEXITCODE"
+  $repairNoLs = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $noLsCmd) -WorkingDirectory $tempRoot -PassThru -Wait
+  Assert-Condition ($repairNoLs.ExitCode -eq 2) "ag-repair.ps1 returns exit code 2 (not 1) when LS endpoint is absent (got $($repairNoLs.ExitCode))"
+
+  # Test watchdog propagation of non-zero failure (exit 3) from ag-repair.ps1
+  @'
+param([switch]$DryRun, [switch]$Quiet)
+[Console]::Error.WriteLine("ERROR: simulated repair failure")
+exit 3
+'@ | Set-Content -Path $mockRepair -Encoding ASCII
+
+  $proc5 = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $testWatchdog, '-Rounds', '1', '-IntervalSec', '1') -WorkingDirectory $tempRoot -PassThru -Wait
+  Assert-Condition ($proc5.ExitCode -eq 3) "Watchdog propagates non-zero exit code 3 from child ag-repair.ps1"
 
 } finally {
   try {

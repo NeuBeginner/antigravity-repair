@@ -34,6 +34,19 @@ $tools = $PSScriptRoot
 $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
 $node = if ($nodeCmd) { $nodeCmd.Source } elseif (Test-Path 'C:\Program Files\nodejs\node.exe') { 'C:\Program Files\nodejs\node.exe' } else { 'node' }
 
+function Invoke-NativeCapture([string]$exe, [string[]]$cmdArgs) {
+  $prevErrPref = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    $raw = & $exe @cmdArgs 2>&1
+    $code = $LASTEXITCODE
+    $lines = @($raw) | ForEach-Object { "$_" }
+    return @{ ExitCode = $code; Lines = $lines }
+  } finally {
+    $ErrorActionPreference = $prevErrPref
+  }
+}
+
 function Get-LsEndpoint {
   $procs = @(Get-CimInstance Win32_Process -Filter "Name='language_server.exe'" -ErrorAction SilentlyContinue)
   if (-not $procs -or $procs.Count -eq 0) {
@@ -46,7 +59,8 @@ function Get-LsEndpoint {
                Select-Object -ExpandProperty LocalPort -Unique)
     foreach ($p in $ports) {
       # Loopback 127.0.0.1 query with strict 4s timeout
-      $html = (& curl.exe -k -s -m 4 "https://127.0.0.1:$p/" 2>$null) -join "`n"
+      $res = Invoke-NativeCapture 'curl.exe' @('-k', '-s', '-m', '4', "https://127.0.0.1:$p/")
+      $html = $res.Lines -join "`n"
       $m = [regex]::Match($html, '"csrfToken":"([^"]+)"')
       if ($m.Success) {
         return @{ Port = $p; Token = $m.Groups[1].Value }
@@ -58,7 +72,9 @@ function Get-LsEndpoint {
 
 $ls = Get-LsEndpoint
 if (-not $ls) {
-  Write-Error "Language Server endpoint not found or not responding on 127.0.0.1."
+  $msg = "ERROR: Language Server endpoint not found or not responding on 127.0.0.1."
+  [Console]::Error.WriteLine($msg)
+  Write-Output $msg
   exit 2
 }
 
@@ -69,11 +85,14 @@ $env:LS_OUT = $dump
 
 # Capture summary dump stream
 $streamScript = Join-Path $tools 'ls_stream.js'
-$out = & $node $streamScript $Seconds 0 2>&1
-$streamExit = $LASTEXITCODE
+$streamRes = Invoke-NativeCapture $node @($streamScript, "$Seconds", '0')
+$streamExit = $streamRes.ExitCode
+$out = $streamRes.Lines
 
 if ($streamExit -ne 0) {
-  Write-Error "Failed to stream summaries from Language Server (exit $streamExit)."
+  $msg = "ERROR: Failed to stream summaries from Language Server (exit $streamExit)."
+  [Console]::Error.WriteLine($msg)
+  Write-Output $msg
   exit $streamExit
 }
 
@@ -93,8 +112,9 @@ if ($DryRun) {
   $nodeArgs += '--dry-run'
 }
 
-$w = & $node $nodeArgs 2>&1
-$writeExit = $LASTEXITCODE
+$writeRes = Invoke-NativeCapture $node $nodeArgs
+$writeExit = $writeRes.ExitCode
+$w = $writeRes.Lines
 
 $last = @($w) | Select-Object -Last 1
 if (-not $Quiet) {
@@ -102,7 +122,9 @@ if (-not $Quiet) {
 }
 
 if ($writeExit -ne 0) {
-  Write-Error "Repair operation failed with exit code $writeExit."
+  $msg = "ERROR: Repair operation failed with exit code $writeExit."
+  [Console]::Error.WriteLine($msg)
+  Write-Output $msg
   exit $writeExit
 }
 

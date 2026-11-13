@@ -2,7 +2,7 @@ const assert = require("assert");
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
-const { execFileSync } = require("child_process");
+const { spawnSync } = require("child_process");
 
 const {
   decodeEntries,
@@ -237,7 +237,7 @@ function runRepairSafetyTests() {
 
       // Execute ls_write_all.js with --dry-run
       const scriptPath = path.resolve(__dirname, "../ls_write_all.js");
-      const stdout = execFileSync(
+      const res = spawnSync(
         process.execPath,
         [scriptPath, "--dry-run"],
         {
@@ -251,10 +251,109 @@ function runRepairSafetyTests() {
         }
       );
 
-      assert.ok(stdout.includes("=== DRY-RUN PLAN (2 items) ==="));
-      assert.ok(stdout.includes(conv1Id));
-      assert.ok(stdout.includes(conv2Id));
-      assert.ok(stdout.includes("[DRY-RUN COMPLETE] Planned updates for 2 summaries. Zero write RPC calls performed."));
+      assert.strictEqual(res.status, 0);
+      assert.ok(res.stdout.includes("=== DRY-RUN PLAN (2 items) ==="));
+      assert.ok(res.stdout.includes(conv1Id));
+      assert.ok(res.stdout.includes(conv2Id));
+      assert.ok(res.stdout.includes("[DRY-RUN COMPLETE] Planned updates for 2 summaries. Zero write RPC calls performed."));
+    } finally {
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch (e) {}
+    }
+  });
+
+  test("empty or comments-only pbtxt throws SafetyCheckError", () => {
+    const rawBuf = encodeEntries([
+      { fn: 1, wt: 2, val: Buffer.from("conv-empty-pbtxt", "utf8") },
+      { fn: 3, wt: 2, val: encodeEntries([{ fn: 1, wt: 0, val: 1731400000n }]) },
+      { fn: 20, wt: 0, val: 17n },
+    ]);
+
+    assert.throws(
+      () => transformSummary(rawBuf, "", "conv-empty-pbtxt"),
+      (err) => err instanceof SafetyCheckError && /empty or contains no recognized/.test(err.message)
+    );
+
+    assert.throws(
+      () => transformSummary(rawBuf, "# only comments\n", "conv-empty-pbtxt"),
+      (err) => err instanceof SafetyCheckError && /empty or contains no recognized/.test(err.message)
+    );
+  });
+
+  test("corrupted pbtxt causes non-zero exit code in ls_write_all.js even when source=0 and field 15 exist", () => {
+    const tempDir = path.join(os.tmpdir(), `ag_test_badpbtxt_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+    const annDir = path.join(tempDir, ".gemini", "antigravity", "annotations");
+    fs.mkdirSync(annDir, { recursive: true });
+
+    try {
+      const convId = "conv-corrupt-pbtxt";
+      const sumBuf = encodeEntries([
+        { fn: 1, wt: 2, val: Buffer.from(convId, "utf8") },
+        { fn: 15, wt: 2, val: encodeEntries([{ fn: 1, wt: 2, val: Buffer.from("Ok", "utf8") }]) },
+        { fn: 20, wt: 0, val: 0n }, // source = 0, field 15 present
+      ]);
+      const entry = encodeEntries([
+        { fn: 1, wt: 2, val: Buffer.from(convId, "utf8") },
+        { fn: 2, wt: 2, val: sumBuf },
+      ]);
+      const dumpFile = path.join(tempDir, "dump.bin");
+      fs.writeFileSync(dumpFile, encodeFrame(encodeEntries([{ fn: 1, wt: 2, val: entry }])));
+
+      // Write malformed pbtxt
+      fs.writeFileSync(path.join(annDir, `${convId}.pbtxt`), 'title: "Unterminated', "utf8");
+
+      const scriptPath = path.resolve(__dirname, "../ls_write_all.js");
+      const res = spawnSync(process.execPath, [scriptPath, "--dry-run"], {
+        cwd: tempDir,
+        env: { ...process.env, LS_STREAM: dumpFile, USERPROFILE: tempDir },
+        encoding: "utf8",
+      });
+
+      assert.notStrictEqual(res.status, 0, "Expected non-zero exit on corrupted pbtxt");
+      assert.ok(res.stderr.includes("Invalid or unreadable pbtxt"), "Expected error message in stderr");
+    } finally {
+      try {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+      } catch (e) {}
+    }
+  });
+
+  test("explicitly unread conversations (marked_as_unread: true) are skipped in ls_write_all.js", () => {
+    const tempDir = path.join(os.tmpdir(), `ag_test_unread_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+    const annDir = path.join(tempDir, ".gemini", "antigravity", "annotations");
+    fs.mkdirSync(annDir, { recursive: true });
+
+    try {
+      const convId = "conv-skip-unread";
+      const sumBuf = encodeEntries([
+        { fn: 1, wt: 2, val: Buffer.from(convId, "utf8") },
+        { fn: 3, wt: 2, val: encodeEntries([{ fn: 1, wt: 0, val: 1731400000n }]) },
+        { fn: 20, wt: 0, val: 17n }, // source = 17
+      ]);
+      const entry = encodeEntries([
+        { fn: 1, wt: 2, val: Buffer.from(convId, "utf8") },
+        { fn: 2, wt: 2, val: sumBuf },
+      ]);
+      const dumpFile = path.join(tempDir, "dump.bin");
+      fs.writeFileSync(dumpFile, encodeFrame(encodeEntries([{ fn: 1, wt: 2, val: entry }])));
+
+      fs.writeFileSync(
+        path.join(annDir, `${convId}.pbtxt`),
+        'title: "Unread"\nmarked_as_unread: true\n',
+        "utf8"
+      );
+
+      const scriptPath = path.resolve(__dirname, "../ls_write_all.js");
+      const res = spawnSync(process.execPath, [scriptPath, "--dry-run"], {
+        cwd: tempDir,
+        env: { ...process.env, LS_STREAM: dumpFile, USERPROFILE: tempDir },
+        encoding: "utf8",
+      });
+
+      assert.strictEqual(res.status, 0);
+      assert.ok(res.stdout.includes(`[SKIP] ${convId}: explicitly marked as unread`));
+      assert.ok(res.stdout.includes("=== DRY-RUN PLAN (0 items) ==="));
     } finally {
       try {
         fs.rmSync(tempDir, { recursive: true, force: true });
