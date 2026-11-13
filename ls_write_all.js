@@ -3,21 +3,24 @@
  * and hardened protobuf annotations.
  *
  * Supports:
- *   --dry-run       Plan changes without calling any write RPC
- *   --backup-dir    Custom directory for binary backups
- *   --limit N       Process at most N summaries
- *   --verify        Read-after-write verification
+ *   --dry-run                Plan changes without calling any write RPC
+ *   --verify / --no-verify   Read-after-write verification via Language Server stream (default: enabled)
+ *   --readback-timeout <ms>  Timeout for read-after-write stream collection (default: 3000)
+ *   --backup-dir <dir>       Custom directory for binary backups
+ *   --limit <n>              Process at most N summaries
  */
 
 const http2 = require("http2");
 const fs = require("fs");
 const path = require("path");
 
-const { decodeFrames, decodeEntries, encodeVarint } = require("./lib/protobuf");
+const { decodeFrames, decodeEntries, encodeFrame, encodeVarint } = require("./lib/protobuf");
+const { parsePbtxt, extractAnnotations } = require("./lib/pbtxt");
 const { createBackupSession, backupSummary } = require("./lib/backup");
 const {
   getSource,
   isArchivedInAnnotations,
+  isMarkedAsUnread,
   transformSummary,
   verifyTransformedSummary,
 } = require("./lib/repair");
@@ -25,8 +28,15 @@ const {
 // CLI Flags
 const args = process.argv.slice(2);
 const isDryRun = args.includes("--dry-run");
+const verifyEnabled = args.includes("--no-verify") ? false : true;
+const readbackTimeoutIdx = args.indexOf("--readback-timeout");
+const readbackTimeoutMs =
+  readbackTimeoutIdx !== -1 ? parseInt(args[readbackTimeoutIdx + 1], 10) : 3000;
 const limitIndex = args.indexOf("--limit");
-const limit = limitIndex !== -1 ? parseInt(args[limitIndex + 1], 10) : parseInt(process.env.LS_LIMIT || "0", 10);
+const limit =
+  limitIndex !== -1
+    ? parseInt(args[limitIndex + 1], 10)
+    : parseInt(process.env.LS_LIMIT || "0", 10);
 const backupDirArg = args.indexOf("--backup-dir");
 const customBackupDir = backupDirArg !== -1 ? args[backupDirArg + 1] : process.env.BACKUP_DIR;
 
@@ -40,9 +50,12 @@ Usage:
   LS_PORT=<port> LS_CSRF=<token> LS_STREAM=<dump.bin> node ls_write_all.js [options]
 
 Options:
-  --dry-run         Simulate changes and print plan without writing to Language Server
-  --limit <n>       Process at most <n> summaries
-  --backup-dir <dir> Store exact original binary backups in <dir>
+  --dry-run                Simulate changes and print plan without writing to Language Server
+  --verify                 Enable read-after-write verification (default)
+  --no-verify              Disable read-after-write verification
+  --readback-timeout <ms>  Timeout in ms for read-after-write check (default: 3000)
+  --limit <n>              Process at most <n> summaries
+  --backup-dir <dir>       Store exact original binary backups in <dir>
 `);
 }
 
@@ -54,19 +67,15 @@ function collectSummariesFromDump(filePath) {
   const map = new Map();
 
   for (const frame of decodeFrames(fileBytes)) {
-    try {
-      const topEntries = decodeEntries(frame.payload);
-      for (const e of topEntries) {
-        if (e.fn !== 1 || e.wt !== 2) continue; // Map entry
-        const sub = decodeEntries(e.val);
-        const k = sub.find((x) => x.fn === 1 && x.wt === 2);
-        const v = sub.find((x) => x.fn === 2 && x.wt === 2);
-        if (k && v) {
-          map.set(k.val.toString("utf8"), v.val);
-        }
+    const topEntries = decodeEntries(frame.payload);
+    for (const e of topEntries) {
+      if (e.fn !== 1 || e.wt !== 2) continue; // Map entry
+      const sub = decodeEntries(e.val);
+      const k = sub.find((x) => x.fn === 1 && x.wt === 2);
+      const v = sub.find((x) => x.fn === 2 && x.wt === 2);
+      if (k && v) {
+        map.set(k.val.toString("utf8"), v.val);
       }
-    } catch (err) {
-      console.warn(`[WARN] Skipping unparseable frame in dump: ${err.message}`);
     }
   }
 
@@ -82,11 +91,109 @@ function makeWriteRequest(id, summaryBuffer) {
   const sumLen = encodeVarint(summaryBuffer.length);
 
   const reqBody = Buffer.concat([idKey, idLen, idBuf, sumKey, sumLen, summaryBuffer]);
-  const frame = Buffer.alloc(5 + reqBody.length);
-  frame[0] = 0;
-  frame.writeUInt32BE(reqBody.length, 1);
-  reqBody.copy(frame, 5);
-  return frame;
+  return encodeFrame(reqBody, 0);
+}
+
+/**
+ * Performs real read-after-write verification by subscribing to JetboxSubscribeToSummaries
+ * on the Language Server and collecting the latest summaries for targetIds.
+ */
+function readBackSummaries(client, targetIds, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const targetSet = new Set(targetIds);
+    const resultMap = new Map();
+    let settled = false;
+    let buf = Buffer.alloc(0);
+    let httpStatus = null;
+    let grpcStatus = null;
+
+    const req = client.request({
+      ":method": "POST",
+      ":path": "/exa.language_server_pb.LanguageServerService/JetboxSubscribeToSummaries",
+      "content-type": "application/grpc+proto",
+      "te": "trailers",
+      "grpc-accept-encoding": "identity",
+      "user-agent": "grpc-node-js/1.0",
+      "accept-encoding": "identity",
+      "origin": `https://127.0.0.1:${port}`,
+      "referer": `https://127.0.0.1:${port}/`,
+      "x-codeium-csrf-token": csrf,
+    });
+
+    const finish = (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        req.close();
+      } catch (e) {}
+      if (err) return reject(err);
+      if (httpStatus !== null && httpStatus !== 200) {
+        return reject(new Error(`Read-back HTTP status ${httpStatus}`));
+      }
+      if (grpcStatus !== null && grpcStatus !== "0" && grpcStatus !== 0) {
+        return reject(new Error(`Read-back gRPC status ${grpcStatus}`));
+      }
+      resolve(resultMap);
+    };
+
+    const timer = setTimeout(() => {
+      finish(null);
+    }, timeoutMs);
+
+    req.on("response", (headers) => {
+      httpStatus = headers[":status"];
+    });
+
+    req.on("trailers", (trailers) => {
+      grpcStatus = trailers["grpc-status"];
+    });
+
+    req.on("error", (err) => {
+      finish(err);
+    });
+
+    req.on("data", (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      try {
+        while (buf.length >= 5) {
+          const len = buf.readUInt32BE(1);
+          if (buf.length < 5 + len) break;
+          const payload = buf.subarray(5, 5 + len);
+          buf = buf.subarray(5 + len);
+
+          const topEntries = decodeEntries(payload);
+          for (const e of topEntries) {
+            if (e.fn !== 1 || e.wt !== 2) continue;
+            const sub = decodeEntries(e.val);
+            const k = sub.find((x) => x.fn === 1 && x.wt === 2);
+            const v = sub.find((x) => x.fn === 2 && x.wt === 2);
+            if (!k || !v) continue;
+            const id = k.val.toString("utf8");
+            if (targetSet.has(id)) {
+              resultMap.set(id, Buffer.from(v.val));
+            }
+          }
+        }
+        if (resultMap.size >= targetSet.size) {
+          finish(null);
+        }
+      } catch (err) {
+        finish(err);
+      }
+    });
+
+    req.on("end", () => {
+      finish(null);
+    });
+
+    req.on("close", () => {
+      finish(null);
+    });
+
+    const reqFrame = encodeFrame(Buffer.from([0x28, 0x00]), 0);
+    req.end(reqFrame);
+  });
 }
 
 async function main() {
@@ -109,34 +216,61 @@ async function main() {
   const annDir = path.join(userDir, ".gemini", "antigravity", "annotations");
 
   const candidates = [];
-  const plan = [];
+  const precheckErrors = [];
 
   for (const [id, rawBuf] of summaryMap) {
     let topEntries;
     try {
       topEntries = decodeEntries(rawBuf);
     } catch (e) {
-      console.warn(`[WARN] Skipping malformed summary for ${id}: ${e.message}`);
+      const msg = `Malformed summary for ${id}: ${e.message}`;
+      precheckErrors.push({ id, error: msg });
+      console.error(`[ERROR] ${msg}`);
       continue;
     }
 
     const currentSrc = getSource(topEntries);
-    let shouldBeArchived = false;
     let pbtxtContent = null;
+    let pbtxtAnn = null;
     let hasPbtxt = false;
 
     const annPath = path.join(annDir, `${id}.pbtxt`);
     if (fs.existsSync(annPath)) {
       try {
         pbtxtContent = fs.readFileSync(annPath, "utf8");
+        if (pbtxtContent.trim().length === 0) {
+          throw new Error("pbtxt file is empty");
+        }
+        const parsed = parsePbtxt(pbtxtContent);
+        pbtxtAnn = extractAnnotations(parsed);
+        const hasRecognized =
+          pbtxtAnn.title !== undefined ||
+          pbtxtAnn.archived !== undefined ||
+          pbtxtAnn.marked_as_unread !== undefined ||
+          pbtxtAnn.last_user_view_time !== undefined ||
+          pbtxtAnn.archival_status_timestamp !== undefined;
+        if (!hasRecognized) {
+          throw new Error("pbtxt contains no recognized annotation fields");
+        }
         hasPbtxt = true;
-        shouldBeArchived = /archived:\s*true/.test(pbtxtContent);
       } catch (err) {
-        console.warn(`[WARN] Could not read pbtxt for ${id}: ${err.message}`);
+        const msg = `Invalid or unreadable pbtxt for ${id}: ${err.message}`;
+        precheckErrors.push({ id, error: msg });
+        console.error(`[ERROR] ${msg}`);
+        continue;
       }
     }
 
+    // Never modify conversations explicitly marked as unread
+    const explicitlyUnread =
+      isMarkedAsUnread(topEntries) || (pbtxtAnn && pbtxtAnn.marked_as_unread === true);
+    if (explicitlyUnread) {
+      console.log(`[SKIP] ${id}: explicitly marked as unread`);
+      continue;
+    }
+
     const isArchived = isArchivedInAnnotations(topEntries);
+    const shouldBeArchived = hasPbtxt && pbtxtAnn.archived !== undefined ? pbtxtAnn.archived : isArchived;
     const hasField15 = topEntries.some((e) => e.fn === 15 && e.wt === 2);
 
     let needsRewrite = false;
@@ -157,7 +291,6 @@ async function main() {
 
     if (needsRewrite) {
       candidates.push({ id, rawBuf, pbtxtContent, reasons });
-      plan.push({ id, reasons });
     }
   }
 
@@ -171,10 +304,18 @@ async function main() {
       console.log(`  - ${item.id}: ${item.reasons.join(", ")}`);
     }
     console.log(`\n[DRY-RUN COMPLETE] Planned updates for ${todo.length} summaries. Zero write RPC calls performed.`);
+    if (precheckErrors.length > 0) {
+      console.error(`[ERROR] ${precheckErrors.length} pre-check error(s) encountered during dry-run.`);
+      process.exit(3);
+    }
     process.exit(0);
   }
 
   if (todo.length === 0) {
+    if (precheckErrors.length > 0) {
+      console.error(`[ERROR] ${precheckErrors.length} pre-check error(s) encountered; aborting with non-zero status.`);
+      process.exit(3);
+    }
     console.log("Nothing to rewrite, all summaries are clean and up to date.");
     process.exit(0);
   }
@@ -193,8 +334,9 @@ async function main() {
   });
 
   let okCount = 0;
-  let failCount = 0;
-  const errors = [];
+  let failCount = precheckErrors.length;
+  const errors = [...precheckErrors];
+  const writtenItems = [];
 
   function doWriteRpc(id, newSummaryBuffer) {
     return new Promise((resolve) => {
@@ -233,20 +375,21 @@ async function main() {
       });
 
       // Step B: Transform summary safely preserving unknown fields
-      const { transformedBuffer } = transformSummary(
+      const { transformedBuffer, expectedState } = transformSummary(
         item.rawBuf,
         item.pbtxtContent,
         item.id,
-        { allowDefaultViewTime: true }
+        { allowDefaultViewTime: true, skipUnread: true }
       );
 
-      // Verify transformed buffer structure locally before sending
-      verifyTransformedSummary(transformedBuffer);
+      // Local pre-flight check before sending over RPC
+      verifyTransformedSummary(transformedBuffer, expectedState);
 
       // Step C: Send write RPC
       const rpcStatus = await doWriteRpc(item.id, transformedBuffer);
       if (rpcStatus === "0" || rpcStatus === 0) {
         okCount++;
+        writtenItems.push({ id: item.id, expectedState });
       } else {
         failCount++;
         errors.push({ id: item.id, error: `RPC status ${rpcStatus}` });
@@ -263,11 +406,49 @@ async function main() {
     }
   }
 
+  // Step D: Real read-after-write verification against Language Server
+  if (verifyEnabled && writtenItems.length > 0) {
+    console.log(`[VERIFY] Reading back ${writtenItems.length} written summaries from Language Server...`);
+    try {
+      const readBackMap = await readBackSummaries(
+        client,
+        writtenItems.map((w) => w.id),
+        readbackTimeoutMs
+      );
+
+      for (const written of writtenItems) {
+        const readBackBuf = readBackMap.get(written.id);
+        if (!readBackBuf) {
+          okCount--;
+          failCount++;
+          const msg = `Read-after-write missing summary for ${written.id}`;
+          errors.push({ id: written.id, error: msg });
+          console.error(`[VERIFY FAIL] ${msg}`);
+          continue;
+        }
+        try {
+          verifyTransformedSummary(readBackBuf, written.expectedState);
+        } catch (err) {
+          okCount--;
+          failCount++;
+          errors.push({ id: written.id, error: `Read-after-write mismatch: ${err.message}` });
+          console.error(`[VERIFY FAIL] Read-after-write verification failed for ${written.id}: ${err.message}`);
+        }
+      }
+      console.log(`[VERIFY] Read-after-write check finished (OK: ${okCount}, Failed: ${failCount})`);
+    } catch (err) {
+      failCount += writtenItems.length;
+      okCount = 0;
+      errors.push({ id: "*", error: `Read-after-write stream failed: ${err.message}` });
+      console.error(`[VERIFY FAIL] Read-after-write stream failed: ${err.message}`);
+    }
+  }
+
   client.close();
 
   console.log(`\n[COMPLETE] DONE ok=${okCount} bad=${failCount}`);
   if (failCount > 0) {
-    console.error(`\n[WARNING] ${failCount} errors encountered during write.`);
+    console.error(`\n[WARNING] ${failCount} errors encountered during write/verification.`);
     console.error(`Backup session is available at: ${sessionDir}`);
     console.error(`To restore exact original state, run:`);
     console.error(`  node ls_restore.js --backup "${sessionDir}"`);

@@ -132,6 +132,45 @@ function runPbtxtTests() {
     assert.throws(() => extractAnnotations("invalid"), /Invalid pbtxt content/);
   });
 
+  test("UTF-8 octal and hex escapes decode Cyrillic titles correctly", () => {
+    // "Привет" in UTF-8 octal bytes: \320\237\321\200\320\270\320\262\320\265\321\202
+    const octalPbtxt = 'title: "\\320\\237\\321\\200\\320\\270\\320\\262\\320\\265\\321\\202"';
+    const octalRes = parsePbtxt(octalPbtxt);
+    assert.strictEqual(octalRes.title, "Привет");
+
+    // "П" in UTF-8 hex bytes: \xd0\x9f
+    const hexPbtxt = 'title: "\\xd0\\x9f!"';
+    const hexRes = parsePbtxt(hexPbtxt);
+    assert.strictEqual(hexRes.title, "П!");
+  });
+
+  test("adjacent string literals concatenate cleanly", () => {
+    const pbtxt = 'title: "Part 1 " "Part 2"';
+    const res = parsePbtxt(pbtxt);
+    assert.strictEqual(res.title, "Part 1 Part 2");
+  });
+
+  test("malformed: mismatched closing bracket throws PbtxtParseError", () => {
+    assert.throws(
+      () => parsePbtxt("last_user_view_time { seconds: 1 >"),
+      (err) => err instanceof PbtxtParseError && /Mismatched closing bracket/.test(err.message)
+    );
+  });
+
+  test("extractAnnotations rejects duplicate or ambiguous scalar fields", () => {
+    const dupTitle = parsePbtxt('title: "First"\ntitle: "Second"');
+    assert.throws(
+      () => extractAnnotations(dupTitle),
+      (err) => err instanceof PbtxtParseError && /Invalid or ambiguous 'title'/.test(err.message)
+    );
+
+    const badArch = parsePbtxt('archived: "yes"');
+    assert.throws(
+      () => extractAnnotations(badArch),
+      (err) => err instanceof PbtxtParseError && /Invalid or ambiguous 'archived'/.test(err.message)
+    );
+  });
+
   console.log(`PBTXT Suite Passed: ${passed} tests.\n`);
   return passed;
 }

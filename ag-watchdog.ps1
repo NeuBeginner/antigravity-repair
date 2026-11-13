@@ -42,7 +42,7 @@ try {
       if ($DryRun) {
         $argsList += '-DryRun'
       }
-      $r = & powershell @argsList 2>&1
+      $r = @(& powershell @argsList 2>&1) | ForEach-Object { "$_" }
       $lastExit = $LASTEXITCODE
       $line = (@($r) | Where-Object { $_ -match 'REPAIRED|OK|LS not ready|Language Server endpoint not found|error' } | Select-Object -Last 1)
       if (-not $line) {

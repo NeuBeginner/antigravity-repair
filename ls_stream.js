@@ -1,67 +1,51 @@
 // Read the LS summaries stream and report the `source` distribution.
 // usage: LS_PORT=49976 LS_CSRF=... node ls_stream.js [seconds] [reqVariant]
 const http2 = require("http2");
+const fs = require("fs");
+const { decodeEntries, encodeFrame } = require("./lib/protobuf");
 
 const port = process.env.LS_PORT;
 const csrf = process.env.LS_CSRF || "";
 const seconds = parseInt(process.argv[2] || "20", 10);
 const variant = parseInt(process.argv[3] || "0", 10);
-if (!port) { console.log("LS_PORT required"); process.exit(2); }
+if (!port) {
+  console.error("LS_PORT required");
+  process.exit(2);
+}
+if (!Number.isFinite(seconds) || seconds < 0) {
+  console.error("Invalid seconds argument");
+  process.exit(2);
+}
 
-function readVarint(b, i) {
-  let s = 0, v = 0;
-  for (;;) {
-    const x = b[i++];
-    v |= (x & 0x7f) << s;
-    if (!(x & 0x80)) return [v >>> 0, i];
-    s += 7;
-    if (s > 35) throw new Error("varint");
-  }
-}
-function varintBuf(n) {
-  const o = [];
-  while (n > 127) { o.push((n & 127) | 128); n >>>= 7; }
-  o.push(n);
-  return Buffer.from(o);
-}
-function entries(buf) {
-  const out = []; let i = 0;
-  while (i < buf.length) {
-    const [key, ni] = readVarint(buf, i);
-    const fn = key >>> 3, wt = key & 7;
-    i = ni;
-    let val = null;
-    if (wt === 0) { const [v, n2] = readVarint(buf, i); val = v; i = n2; }
-    else if (wt === 2) { const [ln, n2] = readVarint(buf, i); i = n2; val = buf.slice(i, i + ln); i += ln; }
-    else if (wt === 1) { val = buf.slice(i, i + 8); i += 8; }
-    else if (wt === 5) { val = buf.slice(i, i + 4); i += 4; }
-    else throw new Error("wt " + wt);
-    out.push({ fn, wt, val });
-  }
-  return out;
-}
 function summarySource(sum) {
-  for (const e of entries(sum)) if (e.fn === 20) return e.val;
+  for (const e of decodeEntries(sum)) {
+    if (e.fn === 20 && e.wt === 0) return Number(e.val);
+  }
   return null; // absent => proto3 default 0 (local)
 }
+
 function summaryTitle(sum) {
-  for (const e of entries(sum)) if (e.fn === 1 && e.wt === 2) return e.val.toString("utf8");
+  for (const e of decodeEntries(sum)) {
+    if (e.fn === 1 && e.wt === 2) return e.val.toString("utf8");
+  }
   return "";
 }
 
+// TLS Note: Antigravity language_server uses a local self-signed certificate bound strictly to 127.0.0.1.
 const client = http2.connect(`https://127.0.0.1:${port}`, { rejectUnauthorized: false });
-client.on("error", (e) => { console.log("CLIENT ERROR:", e.message); process.exit(1); });
+client.on("error", (e) => {
+  console.error("CLIENT ERROR:", e.message);
+  process.exit(1);
+});
 
 // JetboxSubscribeToSummariesRequest: field 5 = backend (varint)
-const body = variant === 0
-  ? Buffer.from([0x28, 0x00])
-  : variant === 1
-    ? Buffer.from([])
-    : Buffer.from([0x28, 0x01]);
-const frame = Buffer.alloc(5 + body.length);
-frame[0] = 0;
-frame.writeUInt32BE(body.length, 1);
-body.copy(frame, 5);
+const body =
+  variant === 0
+    ? Buffer.from([0x28, 0x00])
+    : variant === 1
+      ? Buffer.from([])
+      : Buffer.from([0x28, 0x01]);
+const frame = encodeFrame(body, 0);
 
 const req = client.request({
   ":method": "POST",
@@ -76,31 +60,44 @@ const req = client.request({
   "x-codeium-csrf-token": csrf,
 });
 
+let httpStatus = null;
 let grpcStatus = null;
+let reqError = null;
+let parseErrors = 0;
+let saveError = null;
 let buf = Buffer.alloc(0);
-const seen = new Map();     // key -> source
+const seen = new Map(); // key -> source
 const titles = new Map();
-let frames = 0, updates = 0;
+let frames = 0;
+let updates = 0;
 const outPath = process.env.LS_OUT || "";
 let outBuf = Buffer.alloc(0);
 
-req.on("response", (h) => { console.log("http-status:", h[":status"]); });
-req.on("trailers", (t) => { grpcStatus = t["grpc-status"]; });
-req.on("error", (e) => { console.log("REQ ERROR:", e.message); });
+req.on("response", (h) => {
+  httpStatus = h[":status"];
+  console.log("http-status:", httpStatus);
+});
+req.on("trailers", (t) => {
+  grpcStatus = t["grpc-status"];
+});
+req.on("error", (e) => {
+  reqError = e.message;
+  console.error("REQ ERROR:", e.message);
+});
 req.on("data", (chunk) => {
   buf = Buffer.concat([buf, chunk]);
   while (buf.length >= 5) {
     const len = buf.readUInt32BE(1);
     if (buf.length < 5 + len) break;
-    const frameBuf = buf.slice(0, 5 + len);
-    const payload = buf.slice(5, 5 + len);
-    buf = buf.slice(5 + len);
+    const frameBuf = buf.subarray(0, 5 + len);
+    const payload = buf.subarray(5, 5 + len);
+    buf = buf.subarray(5 + len);
     frames++;
     if (outPath) outBuf = Buffer.concat([outBuf, frameBuf]);
     try {
-      for (const e of entries(payload)) {
+      for (const e of decodeEntries(payload)) {
         if (e.fn !== 1 || e.wt !== 2) continue;
-        const sub = entries(e.val);
+        const sub = decodeEntries(e.val);
         const k = sub.find((x) => x.fn === 1 && x.wt === 2);
         const v = sub.find((x) => x.fn === 2 && x.wt === 2);
         if (!k || !v) continue;
@@ -109,15 +106,27 @@ req.on("data", (chunk) => {
         seen.set(key, summarySource(v.val));
         if (!titles.has(key)) titles.set(key, summaryTitle(v.val));
       }
-    } catch (e) { console.log("parse error:", e.message); }
+    } catch (e) {
+      parseErrors++;
+      console.error("parse error:", e.message);
+    }
   }
 });
 req.end(frame);
 
 setTimeout(() => {
+  if (buf.length > 0) {
+    parseErrors++;
+    console.error(`trailing incomplete gRPC frame bytes: ${buf.length}`);
+  }
   if (outPath) {
-    try { require("fs").writeFileSync(outPath, outBuf); console.log("saved", outPath, outBuf.length, "bytes"); }
-    catch (e) { console.log("save error:", e.message); }
+    try {
+      fs.writeFileSync(outPath, outBuf);
+      console.log("saved", outPath, outBuf.length, "bytes");
+    } catch (e) {
+      saveError = e.message;
+      console.error("save error:", e.message);
+    }
   }
   const dist = new Map();
   let absent = 0;
@@ -131,9 +140,17 @@ setTimeout(() => {
     console.log(`source=${s} : ${n}`);
     if (s === 17) {
       let i = 0;
-      for (const [k, v] of seen) if (v === 17 && i++ < 10) console.log(`   17 key=${k} title=${titles.get(k)}`);
+      for (const [k, v] of seen) {
+        if (v === 17 && i++ < 10) console.log(`   17 key=${k} title=${titles.get(k)}`);
+      }
     }
   }
   client.close();
-  process.exit(0);
+  const hasFailure =
+    reqError !== null ||
+    saveError !== null ||
+    parseErrors > 0 ||
+    (httpStatus !== null && httpStatus !== 200) ||
+    (grpcStatus !== null && grpcStatus !== "0" && grpcStatus !== 0);
+  process.exit(hasFailure ? 1 : 0);
 }, seconds * 1000);

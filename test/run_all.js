@@ -43,7 +43,7 @@ async function main() {
     execFileSync("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", psScript], {
       stdio: "inherit",
     });
-    totalTests += 10;
+    totalTests += 16;
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
     console.log("==================================================");
